@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <meta name="theme-color" content="#222222">
+
+    <title>GPS Geofence POC</title>
+
+    <style>
+        body {
+            font-family: sans-serif;
+            max-width: 800px;
+            margin: auto;
+            padding: 20px;
+        }
+
+        section {
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            margin-top: 10px;
+        }
+
+        input {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 8px;
+            margin-top: 4px;
+        }
+
+        button {
+            padding: 10px 15px;
+            margin-top: 15px;
+            cursor: pointer;
+        }
+
+        #position {
+            font-family: monospace;
+            white-space: pre;
+        }
+
+        #log {
+            background: #111;
+            color: #eee;
+            padding: 10px;
+            height: 250px;
+            overflow: auto;
+            font-family: monospace;
+            font-size: 13px;
+        }
+
+        .inside {
+            color: green;
+            font-weight: bold;
+        }
+
+        .outside {
+            color: red;
+            font-weight: bold;
+        }
+    </style>
+</head>
+
+<body>
+
+<h1>GPS Geofence POC</h1>
+
+<section>
+    <h2>Position GPS</h2>
+
+    <div id="position">
+        Recherche de la position...
+    </div>
+
+    <button id="createZone">
+        Créer une zone avec ma position actuelle
+    </button>
+</section>
+
+
+<section>
+    <h2>Zone</h2>
+
+    <form id="zoneForm">
+
+        <label>
+            Latitude
+            <input
+                type="number"
+                id="latitude"
+                step="0.000001"
+                required
+            >
+        </label>
+
+        <label>
+            Longitude
+            <input
+                type="number"
+                id="longitude"
+                step="0.000001"
+                required
+            >
+        </label>
+
+        <label>
+            Diamètre (mètres)
+            <input
+                type="number"
+                id="diameter"
+                value="100"
+                min="1"
+                required
+            >
+        </label>
+
+        <label>
+            URL du webhook
+            <input
+                type="url"
+                id="webhook"
+                placeholder="https://example.com/webhook"
+                required
+            >
+        </label>
+
+        <button type="submit">
+            Enregistrer la zone
+        </button>
+
+    </form>
+
+    <div id="zoneStatus"></div>
+</section>
+
+
+<section>
+    <h2>État</h2>
+
+    <div id="state">
+        Zone non configurée
+    </div>
+</section>
+
+
+<section>
+    <h2>Log</h2>
+
+    <pre id="log"></pre>
+</section>
+
+
+<script>
+
+let currentPosition = null;
+let zone = null;
+
+let inside = false;
+
+let serviceWorkerReady = false;
+
+
+// ------------------------------------------------------------
+// LOG
+// ------------------------------------------------------------
+
+function log(message) {
+
+    const time = new Date().toLocaleTimeString();
+
+    const element = document.getElementById("log");
+
+    element.textContent += `[${time}] ${message}\n`;
+
+    element.scrollTop = element.scrollHeight;
+
+    console.log(message);
+}
+
+
+// ------------------------------------------------------------
+// SERVICE WORKER
+// ------------------------------------------------------------
+
+async function registerServiceWorker() {
+
+    if (!("serviceWorker" in navigator)) {
+
+        log("Service Worker non supporté");
+
+        return;
+    }
+
+    try {
+
+        const registration =
+            await navigator.serviceWorker.register("./sw.js");
+
+        log("Service Worker enregistré");
+
+        await navigator.serviceWorker.ready;
+
+        serviceWorkerReady = true;
+
+        log("Service Worker prêt");
+
+    } catch (error) {
+
+        log("Erreur Service Worker : " + error);
+
+    }
+}
+
+
+// ------------------------------------------------------------
+// GPS
+// ------------------------------------------------------------
+
+function startGPS() {
+
+    if (!("geolocation" in navigator)) {
+
+        document.getElementById("position").textContent =
+            "Géolocalisation non supportée";
+
+        return;
+    }
+
+    navigator.geolocation.watchPosition(
+
+        position => {
+
+            currentPosition = position;
+
+            const latitude =
+                position.coords.latitude;
+
+            const longitude =
+                position.coords.longitude;
+
+            const accuracy =
+                position.coords.accuracy;
+
+            document.getElementById("position").textContent =
+                `Latitude  : ${latitude}
+Longitude : ${longitude}
+Précision  : ${accuracy.toFixed(1)} m`;
+
+            checkGeofence(position);
+
+        },
+
+        error => {
+
+            log(
+                `Erreur GPS ${error.code}: ${error.message}`
+            );
+
+        },
+
+        {
+            enableHighAccuracy: true,
+
+            maximumAge: 0,
+
+            timeout: 30000
+        }
+    );
+
+    log("watchPosition() démarré");
+}
+
+
+// ------------------------------------------------------------
+// FORMULAIRE
+// ------------------------------------------------------------
+
+document
+    .getElementById("createZone")
+    .addEventListener("click", () => {
+
+        if (!currentPosition) {
+
+            alert(
+                "La position GPS n'est pas encore disponible."
+            );
+
+            return;
+        }
+
+        document.getElementById("latitude").value =
+            currentPosition.coords.latitude.toFixed(6);
+
+        document.getElementById("longitude").value =
+            currentPosition.coords.longitude.toFixed(6);
+
+        document.getElementById("diameter").value =
+            100;
+
+        document.getElementById("webhook").value =
+            "";
+
+        log("Formulaire initialisé avec la position actuelle");
+    });
+
+
+document
+    .getElementById("zoneForm")
+    .addEventListener("submit", event => {
+
+        event.preventDefault();
+
+        zone = {
+
+            latitude:
+                Number(
+                    document.getElementById("latitude").value
+                ),
+
+            longitude:
+                Number(
+                    document.getElementById("longitude").value
+                ),
+
+            diameter:
+                Number(
+                    document.getElementById("diameter").value
+                ),
+
+            webhook:
+                document.getElementById("webhook").value
+        };
+
+        localStorage.setItem(
+            "geofence",
+            JSON.stringify(zone)
+        );
+
+        inside = false;
+
+        updateZoneStatus();
+
+        log("Zone enregistrée");
+
+        log(JSON.stringify(zone));
+    });
+
+
+// ------------------------------------------------------------
+// CHARGEMENT ZONE
+// ------------------------------------------------------------
+
+function loadZone() {
+
+    const value =
+        localStorage.getItem("geofence");
+
+    if (!value) {
+        return;
+    }
+
+    try {
+
+        zone = JSON.parse(value);
+
+        document.getElementById("latitude").value =
+            zone.latitude;
+
+        document.getElementById("longitude").value =
+            zone.longitude;
+
+        document.getElementById("diameter").value =
+            zone.diameter;
+
+        document.getElementById("webhook").value =
+            zone.webhook;
+
+        updateZoneStatus();
+
+        log("Zone chargée depuis localStorage");
+
+    } catch (error) {
+
+        log("Impossible de charger la zone");
+
+    }
+}
+
+
+// ------------------------------------------------------------
+// GEOFENCING
+// ------------------------------------------------------------
+
+function distanceMeters(
+    lat1,
+    lon1,
+    lat2,
+    lon2
+) {
+
+    const R = 6371000;
+
+    const dLat =
+        (lat2 - lat1) * Math.PI / 180;
+
+    const dLon =
+        (lon2 - lon1) * Math.PI / 180;
+
+    const a =
+        Math.sin(dLat / 2) ** 2 +
+
+        Math.cos(lat1 * Math.PI / 180) *
+        Math.cos(lat2 * Math.PI / 180) *
+        Math.sin(dLon / 2) ** 2;
+
+    const c =
+        2 * Math.atan2(
+            Math.sqrt(a),
+            Math.sqrt(1 - a)
+        );
+
+    return R * c;
+}
+
+
+function checkGeofence(position) {
+
+    if (!zone) {
+        return;
+    }
+
+    const distance =
+        distanceMeters(
+
+            position.coords.latitude,
+            position.coords.longitude,
+
+            zone.latitude,
+            zone.longitude
+        );
+
+    const radius =
+        zone.diameter / 2;
+
+
+    /*
+     * Hystérésis GPS :
+     *
+     * entrée : rayon
+     * sortie : rayon + 20 m
+     */
+
+    const exitRadius =
+        radius + 20;
+
+
+    document.getElementById("state").textContent =
+        `Distance : ${distance.toFixed(1)} m
+Rayon : ${radius} m
+État : ${inside ? "DANS LA ZONE" : "HORS ZONE"}`;
+
+
+    // --------------------------------------------------------
+    // ENTRÉE
+    // --------------------------------------------------------
+
+    if (!inside && distance <= radius) {
+
+        inside = true;
+
+        log(
+            `ENTRÉE dans la zone (${distance.toFixed(1)} m)`
+        );
+
+        triggerWebhook("enter", position);
+    }
+
+
+    // --------------------------------------------------------
+    // SORTIE
+    // --------------------------------------------------------
+
+    else if (inside && distance >= exitRadius) {
+
+        inside = false;
+
+        log(
+            `SORTIE de la zone (${distance.toFixed(1)} m)`
+        );
+
+        // Pour le POC on ne déclenche pas de webhook
+        // à la sortie.
+    }
+}
+
+
+// ------------------------------------------------------------
+// WEBHOOK
+// ------------------------------------------------------------
+
+async function triggerWebhook(event, position) {
+
+    if (!zone) {
+        return;
+    }
+
+    const payload = {
+
+        event,
+
+        latitude:
+            position.coords.latitude,
+
+        longitude:
+            position.coords.longitude,
+
+        accuracy:
+            position.coords.accuracy,
+
+        timestamp:
+            new Date().toISOString()
+    };
+
+
+    log(
+        `Webhook demandé : ${zone.webhook}`
+    );
+
+
+    // --------------------------------------------------------
+    // Passage par le Service Worker
+    // --------------------------------------------------------
+
+    if (
+        serviceWorkerReady &&
+        navigator.serviceWorker.controller
+    ) {
+
+        navigator.serviceWorker.controller.postMessage({
+
+            type: "WEBHOOK",
+
+            url: zone.webhook,
+
+            payload
+
+        });
+
+        log("Demande envoyée au Service Worker");
+
+        return;
+    }
+
+
+    // Fallback direct si le SW n'est pas encore contrôleur
+
+    log(
+        "Service Worker non contrôleur : fetch direct"
+    );
+
+    try {
+
+        const response =
+            await fetch(
+                zone.webhook,
+                {
+                    method: "POST",
+
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
+
+                    body:
+                        JSON.stringify(payload)
+                }
+            );
+
+        log(
+            `Webhook HTTP ${response.status}`
+        );
+
+    } catch (error) {
+
+        log(
+            "Erreur webhook : " + error
+        );
+    }
+}
+
+
+// ------------------------------------------------------------
+// UI
+// ------------------------------------------------------------
+
+function updateZoneStatus() {
+
+    if (!zone) {
+
+        document.getElementById("zoneStatus")
+            .textContent =
+            "Aucune zone configurée";
+
+        return;
+    }
+
+    document.getElementById("zoneStatus")
+        .textContent =
+        `Zone : ${zone.latitude}, ${zone.longitude}
+Diamètre : ${zone.diameter} m
+Webhook : ${zone.webhook}`;
+}
+
+
+// ------------------------------------------------------------
+// INIT
+// ------------------------------------------------------------
+
+(async function () {
+
+    await registerServiceWorker();
+
+    loadZone();
+
+    startGPS();
+
+})();
+
+</script>
+
+</body>
+</html>
