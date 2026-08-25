@@ -438,7 +438,12 @@ async function sendWebhook(url, payload) {
 
         await log("Webhook non configuré");
 
-        return;
+        return {
+
+            ok: false,
+
+            error: "Webhook non configuré"
+        };
     }
 
     await log(`Appel webhook : ${url}`);
@@ -468,6 +473,13 @@ async function sendWebhook(url, payload) {
             `${payload.event} - webhook HTTP ${response.status}`
         );
 
+        return {
+
+            ok: response.ok,
+
+            status: response.status
+        };
+
     } catch (error) {
 
         await log("Erreur webhook : " + error);
@@ -476,6 +488,13 @@ async function sendWebhook(url, payload) {
             "geo-trigger",
             "Erreur webhook : " + error
         );
+
+        return {
+
+            ok: false,
+
+            error: String(error)
+        };
     }
 }
 
@@ -631,20 +650,31 @@ async function handleMessage(data, event) {
 
         case "TEST_WEBHOOK": {
 
+            /*
+             * L'URL transmise par la page prime sur celle de la
+             * zone enregistrée : c'est justement AVANT
+             * l'enregistrement qu'on veut vérifier qu'une URL
+             * répond.
+             */
+
             const zone = await readValue(ZONE_KEY);
+
+            const url =
+                data.url || (zone && zone.webhook);
 
             await log("Test manuel du webhook");
 
-            await sendWebhook(
-                zone && zone.webhook,
-                {
-                    event: "test",
+            const result =
+                await sendWebhook(
+                    url,
+                    {
+                        event: "test",
 
-                    timestamp: new Date().toISOString()
-                }
-            );
+                        timestamp: new Date().toISOString()
+                    }
+                );
 
-            reply(event, { ok: true });
+            reply(event, result);
 
             break;
         }

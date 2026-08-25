@@ -607,13 +607,78 @@ document
     .getElementById("testWebhook")
     .addEventListener("click", async () => {
 
+        const button =
+            document.getElementById("testWebhook");
+
+        const input =
+            document.getElementById("webhook");
+
+
+        /*
+         * On teste l'URL saisie dans le formulaire, pas celle de
+         * la zone enregistrée : on veut pouvoir vérifier une URL
+         * avant de la valider.
+         */
+
+        const url = input.value.trim();
+
+        if (!url || !input.checkValidity()) {
+
+            alert(
+                "Renseigne une URL de webhook valide."
+            );
+
+            input.focus();
+
+            return;
+        }
+
+
+        // Geste utilisateur : le résultat du test passe par une
+        // notification, c'est donc le bon moment pour en
+        // demander la permission.
+
+        await requestNotificationPermission();
+
+
+        const label = button.textContent;
+
+        button.disabled = true;
+
+        button.textContent = "Test en cours...";
+
         try {
 
-            await send({ type: "TEST_WEBHOOK" });
+            const result =
+                await send({
+
+                    type: "TEST_WEBHOOK",
+
+                    url
+                });
+
+            if (result.ok) {
+
+                log(`Test réussi : HTTP ${result.status}`);
+
+            } else if (result.status !== undefined) {
+
+                log(`Test en échec : HTTP ${result.status}`);
+
+            } else {
+
+                log("Test en échec : " + result.error);
+            }
 
         } catch (error) {
 
             log("Test impossible : " + error.message);
+
+        } finally {
+
+            button.disabled = false;
+
+            button.textContent = label;
         }
     });
 
