@@ -41,7 +41,9 @@
             cursor: pointer;
         }
 
-        #position {
+        #position,
+        #state,
+        #zoneStatus {
             font-family: monospace;
             white-space: pre;
         }
@@ -65,12 +67,41 @@
             color: red;
             font-weight: bold;
         }
+
+        .warning {
+            border-color: #c88;
+            background: #fff6f6;
+        }
+
+        .warning h2 {
+            margin-top: 0;
+        }
     </style>
 </head>
 
 <body>
 
 <h1>GPS Geofence POC</h1>
+
+
+<section class="warning">
+    <h2>À savoir</h2>
+
+    <p>
+        Le calcul de la zone, l'hystérésis et l'appel du
+        webhook sont désormais effectués par le
+        <strong>Service Worker</strong>, pas par cette page.
+    </p>
+
+    <p>
+        L'API <code>Geolocation</code> n'étant pas disponible
+        dans un Service Worker, cette page reste néanmoins
+        nécessaire pour <em>fournir</em> les positions GPS.
+        Elle n'a plus besoin d'être au premier plan, mais elle
+        doit rester ouverte.
+    </p>
+</section>
+
 
 <section>
     <h2>Position GPS</h2>
@@ -137,6 +168,10 @@
 
     </form>
 
+    <button id="testWebhook">
+        Tester le webhook
+    </button>
+
     <div id="zoneStatus"></div>
 </section>
 
@@ -160,28 +195,47 @@
 <script>
 
 let currentPosition = null;
+
 let zone = null;
 
-let inside = false;
-
-let serviceWorkerReady = false;
+let configLoaded = false;
 
 
 // ------------------------------------------------------------
 // LOG
+//
+// Le journal de référence vit dans le Service Worker : la page
+// affiche ce qu'il lui pousse, plus ses propres messages
+// locaux.
 // ------------------------------------------------------------
 
-function log(message) {
-
-    const time = new Date().toLocaleTimeString();
+function appendLog(time, message) {
 
     const element = document.getElementById("log");
 
     element.textContent += `[${time}] ${message}\n`;
 
     element.scrollTop = element.scrollHeight;
+}
+
+
+function log(message) {
+
+    appendLog(
+        new Date().toLocaleTimeString(),
+        message
+    );
 
     console.log(message);
+}
+
+
+function logEntry(entry) {
+
+    appendLog(
+        new Date(entry.time).toLocaleTimeString(),
+        entry.message
+    );
 }
 
 
@@ -195,32 +249,144 @@ async function registerServiceWorker() {
 
         log("Service Worker non supporté");
 
-        return;
+        return false;
     }
 
     try {
 
-        const registration =
-            await navigator.serviceWorker.register("./sw.js");
+        await navigator.serviceWorker.register("./sw.js");
 
         log("Service Worker enregistré");
 
         await navigator.serviceWorker.ready;
 
-        serviceWorkerReady = true;
+        navigator.serviceWorker.addEventListener(
+            "message",
+            event => onWorkerMessage(event.data)
+        );
+
+
+        /*
+         * Au premier chargement le Service Worker vient d'être
+         * installé et ne contrôle pas encore la page :
+         * postMessage() n'aboutirait nulle part. On attend donc
+         * le passage en contrôleur (clients.claim()).
+         */
+
+        if (!navigator.serviceWorker.controller) {
+
+            log("En attente du contrôleur...");
+
+            await new Promise(resolve => {
+
+                navigator.serviceWorker.addEventListener(
+                    "controllerchange",
+                    resolve,
+                    { once: true }
+                );
+
+                setTimeout(resolve, 3000);
+            });
+        }
+
+        /*
+         * Le Service Worker peut prendre le contrôle plus tard
+         * (installation lente, mise à jour) : on récupère alors
+         * la configuration sans demander de rechargement.
+         */
+
+        navigator.serviceWorker.addEventListener(
+            "controllerchange",
+            () => {
+
+                if (!configLoaded) {
+
+                    loadConfig();
+                }
+            }
+        );
+
+        if (!navigator.serviceWorker.controller) {
+
+            log(
+                "Service Worker pas encore contrôleur : en attente"
+            );
+
+            return false;
+        }
 
         log("Service Worker prêt");
+
+        return true;
 
     } catch (error) {
 
         log("Erreur Service Worker : " + error);
 
+        return false;
+    }
+}
+
+
+/*
+ * Envoi d'un message au Service Worker avec réponse, via un
+ * MessageChannel.
+ */
+function send(message) {
+
+    return new Promise((resolve, reject) => {
+
+        const target = navigator.serviceWorker.controller;
+
+        if (!target) {
+
+            reject(
+                new Error("Service Worker non contrôleur")
+            );
+
+            return;
+        }
+
+        const channel = new MessageChannel();
+
+        channel.port1.onmessage =
+            event => resolve(event.data);
+
+        target.postMessage(message, [channel.port2]);
+    });
+}
+
+
+function onWorkerMessage(data) {
+
+    if (!data || !data.type) {
+        return;
+    }
+
+    if (data.type === "LOG") {
+
+        logEntry(data.entry);
+
+        return;
+    }
+
+    if (data.type === "STATE") {
+
+        if (data.zone) {
+
+            zone = data.zone;
+        }
+
+        renderState(data);
     }
 }
 
 
 // ------------------------------------------------------------
 // GPS
+//
+// Seule responsabilité restante de la page : obtenir les
+// positions et les transmettre au Service Worker.
 // ------------------------------------------------------------
 
 function startGPS() {
@@ -253,7 +419,7 @@ function startGPS() {
 Longitude : ${longitude}
 Précision  : ${accuracy.toFixed(1)} m`;
 
-            checkGeofence(position);
+            sendPosition(position);
 
         },
 
@@ -275,6 +441,53 @@ Précision  : ${accuracy.toFixed(1)} m`;
     );
 
     log("watchPosition() démarré");
+}
+
+
+let positionErrorLogged = false;
+
+
+async function sendPosition(position) {
+
+    /*
+     * Un GeolocationPosition n'est pas clonable : on envoie un
+     * objet simple.
+     */
+
+    const payload = {
+
+        latitude: position.coords.latitude,
+
+        longitude: position.coords.longitude,
+
+        accuracy: position.coords.accuracy,
+
+        timestamp: position.timestamp
+    };
+
+    try {
+
+        await send({
+
+            type: "POSITION",
+
+            position: payload
+        });
+
+        positionErrorLogged = false;
+
+    } catch (error) {
+
+        if (!positionErrorLogged) {
+
+            log(
+                "Position non transmise au Service Worker : "
+                + error.message
+            );
+
+            positionErrorLogged = true;
+        }
+    }
 }
 
 
@@ -313,11 +526,11 @@ document
 
 document
     .getElementById("zoneForm")
-    .addEventListener("submit", event => {
+    .addEventListener("submit", async event => {
 
         event.preventDefault();
 
-        zone = {
+        const candidate = {
 
             latitude:
                 Number(
@@ -338,37 +551,126 @@ document
                 document.getElementById("webhook").value
         };
 
-        localStorage.setItem(
-            "geofence",
-            JSON.stringify(zone)
-        );
 
-        inside = false;
+        // Geste utilisateur : bon moment pour demander la
+        // permission de notifier, seule trace visible quand la
+        // page n'est pas au premier plan.
 
-        updateZoneStatus();
+        await requestNotificationPermission();
 
-        log("Zone enregistrée");
 
-        log(JSON.stringify(zone));
+        try {
+
+            const result =
+                await send({
+
+                    type: "SAVE_ZONE",
+
+                    zone: candidate
+                });
+
+            zone = result.zone;
+
+            updateZoneStatus();
+
+            renderState({
+
+                zone: result.zone,
+
+                state: result.state
+            });
+
+
+            /*
+             * Le Service Worker n'évalue une zone qu'à la
+             * réception d'une position. Sans cela l'état
+             * resterait vide jusqu'au prochain tick GPS : on lui
+             * renvoie donc immédiatement la dernière position
+             * connue.
+             */
+
+            if (currentPosition) {
+
+                await sendPosition(currentPosition);
+            }
+
+        } catch (error) {
+
+            log(
+                "Zone non enregistrée : " + error.message
+            );
+        }
     });
 
 
-// ------------------------------------------------------------
-// CHARGEMENT ZONE
-// ------------------------------------------------------------
+document
+    .getElementById("testWebhook")
+    .addEventListener("click", async () => {
 
-function loadZone() {
+        try {
 
-    const value =
-        localStorage.getItem("geofence");
+            await send({ type: "TEST_WEBHOOK" });
 
-    if (!value) {
+        } catch (error) {
+
+            log("Test impossible : " + error.message);
+        }
+    });
+
+
+async function requestNotificationPermission() {
+
+    if (!("Notification" in window)) {
+        return;
+    }
+
+    if (Notification.permission !== "default") {
         return;
     }
 
     try {
 
-        zone = JSON.parse(value);
+        const permission =
+            await Notification.requestPermission();
+
+        log("Notifications : " + permission);
+
+    } catch (error) {
+
+        // Ignoré.
+    }
+}
+
+
+// ------------------------------------------------------------
+// CHARGEMENT DE LA CONFIGURATION
+//
+// La zone est détenue par le Service Worker (IndexedDB), pas
+// par la page.
+// ------------------------------------------------------------
+
+async function loadConfig() {
+
+    try {
+
+        const config =
+            await send({ type: "GET_CONFIG" });
+
+        configLoaded = true;
+
+        for (const entry of config.log) {
+
+            logEntry(entry);
+        }
+
+        if (!config.zone) {
+
+            updateZoneStatus();
+
+            return;
+        }
+
+        zone = config.zone;
 
         document.getElementById("latitude").value =
             zone.latitude;
@@ -384,213 +686,19 @@ function loadZone() {
 
         updateZoneStatus();
 
-        log("Zone chargée depuis localStorage");
+        renderState({
 
-    } catch (error) {
+            zone: config.zone,
 
-        log("Impossible de charger la zone");
-
-    }
-}
-
-
-// ------------------------------------------------------------
-// GEOFENCING
-// ------------------------------------------------------------
-
-function distanceMeters(
-    lat1,
-    lon1,
-    lat2,
-    lon2
-) {
-
-    const R = 6371000;
-
-    const dLat =
-        (lat2 - lat1) * Math.PI / 180;
-
-    const dLon =
-        (lon2 - lon1) * Math.PI / 180;
-
-    const a =
-        Math.sin(dLat / 2) ** 2 +
-
-        Math.cos(lat1 * Math.PI / 180) *
-        Math.cos(lat2 * Math.PI / 180) *
-        Math.sin(dLon / 2) ** 2;
-
-    const c =
-        2 * Math.atan2(
-            Math.sqrt(a),
-            Math.sqrt(1 - a)
-        );
-
-    return R * c;
-}
-
-
-function checkGeofence(position) {
-
-    if (!zone) {
-        return;
-    }
-
-    const distance =
-        distanceMeters(
-
-            position.coords.latitude,
-            position.coords.longitude,
-
-            zone.latitude,
-            zone.longitude
-        );
-
-    const radius =
-        zone.diameter / 2;
-
-
-    /*
-     * Hystérésis GPS :
-     *
-     * entrée : rayon
-     * sortie : rayon + 20 m
-     */
-
-    const exitRadius =
-        radius + 20;
-
-
-    document.getElementById("state").textContent =
-        `Distance : ${distance.toFixed(1)} m
-Rayon : ${radius} m
-État : ${inside ? "DANS LA ZONE" : "HORS ZONE"}`;
-
-
-    // --------------------------------------------------------
-    // ENTRÉE
-    // --------------------------------------------------------
-
-    if (!inside && distance <= radius) {
-
-        inside = true;
-
-        log(
-            `ENTRÉE dans la zone (${distance.toFixed(1)} m)`
-        );
-
-        triggerWebhook("enter", position);
-    }
-
-
-    // --------------------------------------------------------
-    // SORTIE
-    // --------------------------------------------------------
-
-    else if (inside && distance >= exitRadius) {
-
-        inside = false;
-
-        log(
-            `SORTIE de la zone (${distance.toFixed(1)} m)`
-        );
-
-        // Pour le POC on ne déclenche pas de webhook
-        // à la sortie.
-    }
-}
-
-
-// ------------------------------------------------------------
-// WEBHOOK
-// ------------------------------------------------------------
-
-async function triggerWebhook(event, position) {
-
-    if (!zone) {
-        return;
-    }
-
-    const payload = {
-
-        event,
-
-        latitude:
-            position.coords.latitude,
-
-        longitude:
-            position.coords.longitude,
-
-        accuracy:
-            position.coords.accuracy,
-
-        timestamp:
-            new Date().toISOString()
-    };
-
-
-    log(
-        `Webhook demandé : ${zone.webhook}`
-    );
-
-
-    // --------------------------------------------------------
-    // Passage par le Service Worker
-    // --------------------------------------------------------
-
-    if (
-        serviceWorkerReady &&
-        navigator.serviceWorker.controller
-    ) {
-
-        navigator.serviceWorker.controller.postMessage({
-
-            type: "WEBHOOK",
-
-            url: zone.webhook,
-
-            payload
-
+            state: config.state
         });
 
-        log("Demande envoyée au Service Worker");
-
-        return;
-    }
-
-
-    // Fallback direct si le SW n'est pas encore contrôleur
-
-    log(
-        "Service Worker non contrôleur : fetch direct"
-    );
-
-    try {
-
-        const response =
-            await fetch(
-                zone.webhook,
-                {
-                    method: "POST",
-
-                    headers: {
-                        "Content-Type":
-                            "application/json"
-                    },
-
-                    body:
-                        JSON.stringify(payload)
-                }
-            );
-
-        log(
-            `Webhook HTTP ${response.status}`
-        );
+        log("Zone chargée depuis le Service Worker");
 
     } catch (error) {
 
         log(
-            "Erreur webhook : " + error
+            "Configuration illisible : " + error.message
         );
     }
 }
@@ -600,19 +708,54 @@ async function triggerWebhook(event, position) {
 // UI
 // ------------------------------------------------------------
 
-function updateZoneStatus() {
+function renderState(data) {
 
-    if (!zone) {
+    const state = data.state;
 
-        document.getElementById("zoneStatus")
-            .textContent =
-            "Aucune zone configurée";
+    const element = document.getElementById("state");
+
+    if (!data.zone) {
+
+        element.textContent = "Zone non configurée";
 
         return;
     }
 
-    document.getElementById("zoneStatus")
-        .textContent =
+    if (state.distance === null) {
+
+        element.textContent =
+            "En attente d'une position GPS";
+
+        return;
+    }
+
+    const radius =
+        data.radius !== undefined
+            ? data.radius
+            : data.zone.diameter / 2;
+
+    element.textContent =
+        `Distance : ${state.distance.toFixed(1)} m
+Rayon : ${radius} m
+État : ${state.inside ? "DANS LA ZONE" : "HORS ZONE"}`;
+
+    element.className =
+        state.inside ? "inside" : "outside";
+}
+
+
+function updateZoneStatus() {
+
+    const element = document.getElementById("zoneStatus");
+
+    if (!zone) {
+
+        element.textContent = "Aucune zone configurée";
+
+        return;
+    }
+
+    element.textContent =
         `Zone : ${zone.latitude}, ${zone.longitude}
 Diamètre : ${zone.diameter} m
 Webhook : ${zone.webhook}`;
@@ -625,9 +768,12 @@ Webhook : ${zone.webhook}`;
 
 (async function () {
 
-    await registerServiceWorker();
+    const ready = await registerServiceWorker();
 
-    loadZone();
+    if (ready) {
+
+        await loadConfig();
+    }
 
     startGPS();
 
